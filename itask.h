@@ -17,6 +17,8 @@ public:
     virtual bool shouldRetry() const { return retryCount_ < maxRetries_; }
     virtual bool isPeriodic() const { return false; }
     virtual std::chrono::milliseconds getPeriod() const { return std::chrono::milliseconds(0); }
+    virtual bool isCancelled() const { return isCancelled_; }
+    virtual bool isSuspended() const { return isSuspended_; }
 
 protected:
     int retryCount_ = 0;

@@ -6,8 +6,8 @@
 int main()
 {
     std::unique_ptr<IEventLoop> eventLoop(new LibuvEventLoop());
-    TaskScheduler scheduler(eventLoop.get());
     ThreadPool threadPool(4);
+    TaskScheduler scheduler(eventLoop.get(), &threadPool);
     ThreadManager manager(eventLoop.get(), &scheduler, &threadPool);
 
     manager.createServer(8080);

@@ -20,7 +20,7 @@ public:
 
     void execute(INetwork *network) override
     {
-        if (isCancelled_ || isSuspended_)
+        if (isCancelled() || isSuspended())
             return;
         network->send(message_, destAddr_, destPort_);
     }
