@@ -3,10 +3,10 @@ cmake_minimum_required(VERSION 3.25)
 set(CMAKE_CXX_STANDARD 11)
 set(CMAKE_CXX_STANDARD_REQUIRED true)
 
-project(sps VERSION 0.1.0 LANGUAGES C CXX)
+project(event_app VERSION 0.1.0 LANGUAGES C CXX)
 
-add_executable(sps main.cpp)
-target_link_libraries(sps PRIVATE uv)
+add_executable(event_app main.cpp)
+target_link_libraries(event_app PRIVATE uv)
 
 include(CTest)
 enable_testing()
