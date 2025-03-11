@@ -5,6 +5,70 @@
 #include <string>
 #include <sstream>
 #include <chrono>
+#include <thread>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <functional>
+
+class ThreadPool
+{
+public:
+    ThreadPool(size_t numThreads)
+    {
+        for (size_t i = 0; i < numThreads; ++i)
+        {
+            workers_.emplace_back([this]
+                                  {
+                while (true) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(mutex_);
+                        condition_.wait(lock, [this] { return stop_ || !tasks_.empty(); });
+                        if (stop_ && tasks_.empty()) {
+                            return;
+                        }
+                        task = std::move(tasks_.front());
+                        tasks_.pop();
+                    }
+                    task();
+                } });
+        }
+    }
+
+    ~ThreadPool()
+    {
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            stop_ = true;
+        }
+        condition_.notify_all();
+        for (std::thread &worker : workers_)
+        {
+            worker.join();
+        }
+    }
+
+    void enqueue(std::function<void()> task)
+    {
+        {
+            std::unique_lock<std::mutex> lock(mutex_);
+            if (stop_)
+            {
+                throw std::runtime_error("enqueue on stopped ThreadPool");
+            }
+            tasks_.emplace(std::move(task));
+        }
+        condition_.notify_one();
+    }
+
+private:
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool stop_ = false;
+};
 
 // 日志函数
 void log(const std::string &message, const char *file, int line)
@@ -153,13 +217,14 @@ private:
 class UDPServer
 {
 public:
-    UDPServer(int port, uv_loop_t *loop, TaskScheduler *scheduler)
-        : port_(port), loop_(loop), scheduler_(scheduler)
+    UDPServer(int port, uv_loop_t *loop, TaskScheduler *scheduler, ThreadPool *threadPool)
+        : port_(port), loop_(loop), scheduler_(scheduler), threadPool_(threadPool)
     {
         uv_udp_init(loop_, &udpHandle_);
         sockaddr_in addr;
         uv_ip4_addr("0.0.0.0", port_, &addr);
         uv_udp_bind(&udpHandle_, (const struct sockaddr *)&addr, 0);
+        udpHandle_.data = threadPool; // 存储线程池指针
         uv_udp_recv_start(&udpHandle_, onAlloc, onRecv);
     }
 
@@ -182,6 +247,7 @@ private:
     int port_;
     uv_loop_t *loop_;
     TaskScheduler *scheduler_;
+    ThreadPool *threadPool_;
     uv_udp_t udpHandle_;
 
     static void onAlloc(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf)
@@ -196,8 +262,11 @@ private:
         if (nread > 0)
         {
             std::string msg(buf->base, nread);
-            log("Received: " + msg, __FILE__, __LINE__);
-            // 这里可以添加对接收消息的处理逻辑
+            ThreadPool *threadPool = static_cast<ThreadPool *>(handle->data);
+            threadPool->enqueue([msg]
+                                {
+                // CPU 密集型操作：报文解析
+                log("Received and parsed: " + msg, __FILE__, __LINE__); });
         }
         delete[] buf->base;
     }
@@ -207,11 +276,12 @@ private:
 class ThreadManager
 {
 public:
-    ThreadManager(uv_loop_t *loop, TaskScheduler *scheduler) : loop_(loop), scheduler_(scheduler) {}
+    ThreadManager(uv_loop_t *loop, TaskScheduler *scheduler, ThreadPool *threadPool)
+        : loop_(loop), scheduler_(scheduler), threadPool_(threadPool) {}
 
     void createServer(int port)
     {
-        std::unique_ptr<UDPServer> server(new UDPServer(port, loop_, scheduler_));
+        std::unique_ptr<UDPServer> server(new UDPServer(port, loop_, scheduler_, threadPool_));
         servers.push_back(std::move(server));
     }
 
@@ -231,6 +301,7 @@ public:
 private:
     uv_loop_t *loop_;
     TaskScheduler *scheduler_;
+    ThreadPool *threadPool_;
     std::vector<std::unique_ptr<UDPServer>> servers;
 };
 
@@ -239,7 +310,8 @@ int main()
 {
     uv_loop_t *loop = uv_default_loop();
     TaskScheduler scheduler(loop);
-    ThreadManager manager(loop, &scheduler);
+    ThreadPool threadPool(4); // 创建 4 个工作线程
+    ThreadManager manager(loop, &scheduler, &threadPool);
 
     manager.createServer(8080);
     manager.createServer(8081);
