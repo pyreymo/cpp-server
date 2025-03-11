@@ -1,20 +1,10 @@
+#include <uv.h>
 #include <iostream>
 #include <vector>
 #include <memory>
-#include <thread>
-#include <mutex>
-#include <condition_variable>
-#include <queue>
-#include <functional>
-#include <chrono>
 #include <string>
 #include <sstream>
-#include <sys/epoll.h>
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <cstring>
+#include <chrono>
 
 // 日志函数
 void log(const std::string &message, const char *file, int line)
@@ -28,45 +18,51 @@ void log(const std::string &message, const char *file, int line)
 class ITask
 {
 public:
-    virtual ~ITask() = default;
+    virtual ~ITask() {}
     virtual void execute() = 0;
     virtual void suspend() = 0;
     virtual void cancel() = 0;
     virtual size_t getId() const = 0;
     virtual bool shouldRetry() const { return retryCount_ < maxRetries_; }
+    // 添加到接口中，提供默认实现
+    virtual bool isPeriodic() const { return false; }
+    virtual std::chrono::milliseconds getPeriod() const { return std::chrono::milliseconds(0); }
 
 protected:
-    int retryCount_ = 0;
-    int maxRetries_ = 3;
-    bool isSuspended_ = false;
-    bool isCancelled_ = false;
+    int retryCount_;
+    int maxRetries_;
+    bool isSuspended_;
+    bool isCancelled_;
+
+    ITask() : retryCount_(0), maxRetries_(3), isSuspended_(false), isCancelled_(false) {}
 };
 
 // 发送 UDP 报文的任务
 class SendTask : public ITask
 {
 public:
-    SendTask(int socketFd, const std::string &msg, const sockaddr_in &destAddr,
+    SendTask(uv_udp_t *udpHandle, const std::string &msg, const sockaddr_in &destAddr,
              bool isPeriodic = false, std::chrono::milliseconds period = std::chrono::milliseconds(1000))
-        : socketFd_(socketFd), message_(msg), destAddr_(destAddr),
+        : udpHandle_(udpHandle), message_(msg), destAddr_(destAddr),
           isPeriodic_(isPeriodic), period_(period)
     {
-        id_ = std::hash<std::string>{}(msg + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()));
+        id_ = std::hash<std::string>()(msg + std::to_string(std::chrono::system_clock::now().time_since_epoch().count()));
     }
 
-    void execute() override
+    void execute()
     {
         if (isCancelled_ || isSuspended_)
             return;
 
-        socklen_t addrLen = sizeof(destAddr_);
-        ssize_t sent = sendto(socketFd_, message_.c_str(), message_.size(), 0,
-                              (struct sockaddr *)&destAddr_, addrLen);
-        if (sent < 0)
+        uv_udp_send_t *req = new uv_udp_send_t;
+        uv_buf_t buf = uv_buf_init(const_cast<char *>(message_.c_str()), message_.size());
+        int r = uv_udp_send(req, udpHandle_, &buf, 1, (const struct sockaddr *)&destAddr_, onSend);
+        if (r != 0)
         {
             retryCount_++;
             log("Failed to send message, retry " + std::to_string(retryCount_) + "/" + std::to_string(maxRetries_),
                 __FILE__, __LINE__);
+            delete req;
         }
         else
         {
@@ -74,14 +70,23 @@ public:
         }
     }
 
-    void suspend() override { isSuspended_ = true; }
-    void cancel() override { isCancelled_ = true; }
-    size_t getId() const override { return id_; }
+    static void onSend(uv_udp_send_t *req, int status)
+    {
+        if (status != 0)
+        {
+            log("Send failed: " + std::string(uv_strerror(status)), __FILE__, __LINE__);
+        }
+        delete req;
+    }
+
+    void suspend() { isSuspended_ = true; }
+    void cancel() { isCancelled_ = true; }
+    size_t getId() const { return id_; }
     bool isPeriodic() const { return isPeriodic_; }
     std::chrono::milliseconds getPeriod() const { return period_; }
 
 private:
-    int socketFd_;
+    uv_udp_t *udpHandle_;
     std::string message_;
     sockaddr_in destAddr_;
     size_t id_;
@@ -93,30 +98,19 @@ private:
 class TaskScheduler
 {
 public:
-    TaskScheduler() : running_(false) {}
-
-    void start()
-    {
-        running_ = true;
-        thread_ = std::thread(&TaskScheduler::run, this);
-    }
-
-    void stop()
-    {
-        running_ = false;
-        {
-            std::lock_guard<std::mutex> lock(mutex_);
-            cv_.notify_one();
-        }
-        if (thread_.joinable())
-            thread_.join();
-    }
+    TaskScheduler(uv_loop_t *loop) : loop_(loop) {}
 
     void schedule(std::shared_ptr<ITask> task, int priority)
     {
-        std::lock_guard<std::mutex> lock(mutex_);
-        tasks_.push({priority, task});
-        cv_.notify_one();
+        uv_timer_t *timer = new uv_timer_t;
+        uv_timer_init(loop_, timer);
+        TaskEntry *entry = new TaskEntry{priority, task, timer};
+        timer->data = entry;
+
+        // 立即执行任务，周期性任务会根据 period 重复
+        uint64_t timeout = 0;
+        uint64_t repeat = task->isPeriodic() ? task->getPeriod().count() : 0;
+        uv_timer_start(timer, onTimer, timeout, repeat);
     }
 
 private:
@@ -124,42 +118,34 @@ private:
     {
         int priority;
         std::shared_ptr<ITask> task;
-        bool operator<(const TaskEntry &other) const { return priority < other.priority; }
+        uv_timer_t *timer;
     };
 
-    std::priority_queue<TaskEntry> tasks_;
-    std::mutex mutex_;
-    std::condition_variable cv_;
-    std::thread thread_;
-    bool running_;
+    uv_loop_t *loop_;
 
-    void run()
+    static void onTimer(uv_timer_t *handle)
     {
-        while (running_)
+        TaskEntry *entry = static_cast<TaskEntry *>(handle->data);
+        std::shared_ptr<SendTask> task = std::dynamic_pointer_cast<SendTask>(entry->task);
+        task->execute();
+
+        // 如果任务不是周期性的，且需要重试
+        if (!task->isPeriodic() && task->shouldRetry())
         {
-            std::unique_lock<std::mutex> lock(mutex_);
-            cv_.wait(lock, [this]
-                     { return !tasks_.empty() || !running_; });
-            if (!running_)
-                break;
-
-            TaskEntry entry = tasks_.top();
-            tasks_.pop();
-            lock.unlock();
-
-            std::shared_ptr<SendTask> task = std::dynamic_pointer_cast<SendTask>(entry.task);
-            task->execute();
-
-            if (task->isPeriodic() && !task->shouldRetry())
-            {
-                std::this_thread::sleep_for(task->getPeriod());
-                schedule(task, entry.priority);
-            }
-            else if (task->shouldRetry())
-            {
-                schedule(task, entry.priority);
-            }
+            uv_timer_start(handle, onTimer, 1000, 0); // 1秒后重试
         }
+        else if (!task->isPeriodic() && !task->shouldRetry())
+        {
+            uv_timer_stop(handle);
+            delete entry;
+            uv_close((uv_handle_t *)handle, onClose);
+        }
+        // 周期性任务由 libuv 自动重复，无需手动重新调度
+    }
+
+    static void onClose(uv_handle_t *handle)
+    {
+        delete handle;
     }
 };
 
@@ -167,111 +153,53 @@ private:
 class UDPServer
 {
 public:
-    UDPServer(int port, TaskScheduler *scheduler)
-        : port_(port), scheduler_(scheduler), running_(false)
+    UDPServer(int port, uv_loop_t *loop, TaskScheduler *scheduler)
+        : port_(port), loop_(loop), scheduler_(scheduler)
     {
-        initSocket();
+        uv_udp_init(loop_, &udpHandle_);
+        sockaddr_in addr;
+        uv_ip4_addr("0.0.0.0", port_, &addr);
+        uv_udp_bind(&udpHandle_, (const struct sockaddr *)&addr, 0);
+        uv_udp_recv_start(&udpHandle_, onAlloc, onRecv);
     }
 
     ~UDPServer()
     {
-        if (socketFd_ >= 0)
-            close(socketFd_);
-    }
-
-    void start()
-    {
-        running_ = true;
-        thread_ = std::thread(&UDPServer::run, this);
-    }
-
-    void stop()
-    {
-        running_ = false;
-        if (thread_.joinable())
-            thread_.join();
+        uv_udp_recv_stop(&udpHandle_);
+        uv_close((uv_handle_t *)&udpHandle_, nullptr);
     }
 
     void send(const std::string &message, const std::string &destAddr, int destPort,
               bool isPeriodic = false, std::chrono::milliseconds period = std::chrono::milliseconds(1000))
     {
         sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(destPort);
-        inet_pton(AF_INET, destAddr.c_str(), &addr.sin_addr);
-
-        std::shared_ptr<SendTask> task = std::make_shared<SendTask>(socketFd_, message, addr, isPeriodic, period);
+        uv_ip4_addr(destAddr.c_str(), destPort, &addr);
+        std::shared_ptr<SendTask> task = std::make_shared<SendTask>(&udpHandle_, message, addr, isPeriodic, period);
         scheduler_->schedule(task, isPeriodic ? 1 : 0);
     }
 
 private:
     int port_;
+    uv_loop_t *loop_;
     TaskScheduler *scheduler_;
-    std::thread thread_;
-    bool running_;
-    int socketFd_ = -1;
-    int epollFd_ = -1;
+    uv_udp_t udpHandle_;
 
-    void initSocket()
+    static void onAlloc(uv_handle_t *handle, size_t suggested_size, uv_buf_t *buf)
     {
-        socketFd_ = socket(AF_INET, SOCK_DGRAM, 0);
-        if (socketFd_ < 0)
-        {
-            log("Failed to create socket", __FILE__, __LINE__);
-            return;
-        }
-
-        sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htons(port_);
-        if (bind(socketFd_, (struct sockaddr *)&addr, sizeof(addr)) < 0)
-        {
-            log("Failed to bind socket", __FILE__, __LINE__);
-            close(socketFd_);
-            socketFd_ = -1;
-            return;
-        }
-
-        epollFd_ = epoll_create1(0);
-        epoll_event ev;
-        ev.events = EPOLLIN;
-        ev.data.fd = socketFd_;
-        epoll_ctl(epollFd_, EPOLL_CTL_ADD, socketFd_, &ev);
+        buf->base = new char[suggested_size];
+        buf->len = suggested_size;
     }
 
-    void run()
+    static void onRecv(uv_udp_t *handle, ssize_t nread, const uv_buf_t *buf,
+                       const struct sockaddr *addr, unsigned flags)
     {
-        epoll_event events[10];
-        char buffer[1024];
-
-        while (running_)
+        if (nread > 0)
         {
-            int nfds = epoll_wait(epollFd_, events, 10, 1000);
-            for (int i = 0; i < nfds; ++i)
-            {
-                if (events[i].data.fd == socketFd_)
-                {
-                    sockaddr_in srcAddr;
-                    socklen_t addrLen = sizeof(srcAddr);
-                    ssize_t len = recvfrom(socketFd_, buffer, sizeof(buffer) - 1, 0,
-                                           (struct sockaddr *)&srcAddr, &addrLen);
-                    if (len > 0)
-                    {
-                        buffer[len] = '\0';
-                        std::string msg(buffer);
-                        onReceive(msg, srcAddr);
-                    }
-                }
-            }
+            std::string msg(buf->base, nread);
+            log("Received: " + msg, __FILE__, __LINE__);
+            // 这里可以添加对接收消息的处理逻辑
         }
-    }
-
-    void onReceive(const std::string &message, const sockaddr_in &srcAddr)
-    {
-        log("Received: " + message, __FILE__, __LINE__);
-        // std::string ack = "ACK: " + message;
-        // sendto(socketFd_, ack.c_str(), ack.size(), 0, (struct sockaddr *)&srcAddr, sizeof(srcAddr));
+        delete[] buf->base;
     }
 };
 
@@ -279,24 +207,14 @@ private:
 class ThreadManager
 {
 public:
-    ThreadManager(TaskScheduler *scheduler) : scheduler_(scheduler) {}
+    ThreadManager(uv_loop_t *loop, TaskScheduler *scheduler) : loop_(loop), scheduler_(scheduler) {}
 
-    void createServerThread(int port)
+    void createServer(int port)
     {
-        std::unique_ptr<UDPServer> server(new UDPServer(port, scheduler_));
-        server->start();
+        std::unique_ptr<UDPServer> server(new UDPServer(port, loop_, scheduler_));
         servers.push_back(std::move(server));
     }
 
-    void stopAll()
-    {
-        for (std::vector<std::unique_ptr<UDPServer>>::iterator it = servers.begin(); it != servers.end(); ++it)
-        {
-            (*it)->stop();
-        }
-    }
-
-    // 新增公共方法：通过服务器索引发送消息
     void sendMessage(size_t serverIndex, const std::string &message, const std::string &destAddr, int destPort,
                      bool isPeriodic = false, std::chrono::milliseconds period = std::chrono::milliseconds(1000))
     {
@@ -311,6 +229,7 @@ public:
     }
 
 private:
+    uv_loop_t *loop_;
     TaskScheduler *scheduler_;
     std::vector<std::unique_ptr<UDPServer>> servers;
 };
@@ -318,20 +237,17 @@ private:
 // 主函数
 int main()
 {
-    TaskScheduler scheduler;
-    scheduler.start();
+    uv_loop_t *loop = uv_default_loop();
+    TaskScheduler scheduler(loop);
+    ThreadManager manager(loop, &scheduler);
 
-    ThreadManager manager(&scheduler);
-    manager.createServerThread(8080);
-    manager.createServerThread(8081);
+    manager.createServer(8080);
+    manager.createServer(8081);
 
-    // 使用公共接口发送消息
     manager.sendMessage(0, "Hello from 8080", "127.0.0.1", 8081, true, std::chrono::milliseconds(2000));
     manager.sendMessage(1, "Hello from 8081", "127.0.0.1", 8080);
 
-    std::this_thread::sleep_for(std::chrono::seconds(10));
-    manager.stopAll();
-    scheduler.stop();
+    uv_run(loop, UV_RUN_DEFAULT);
 
     return 0;
 }

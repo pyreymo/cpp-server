@@ -6,6 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED true)
 project(sps VERSION 0.1.0 LANGUAGES C CXX)
 
 add_executable(sps main.cpp)
+target_link_libraries(sps PRIVATE uv)
 
 include(CTest)
 enable_testing()
